@@ -28,3 +28,16 @@ Decisions from brainstorm with user:
 - v0 scope: incus-vm only (incus.tar.xz + disk-kvm.img ftypes). No containers — Incus pulls OCI app containers natively; system-container repr would be an imgoci spec addendum, not our problem. Un-annotated releases skipped+logged.
 - Proxy stateless, metadata-only: sha256/size from imgoci content annotations; no file reads at catalog build; file GETs stream from registry w/ on-the-fly decompression; combined hashes relayed producer-asserted, unverified in v0.
 Spawned software-architect agent SsOciArchitect for first-draft architecture (9-point deliverable incl. Incus protocol verification, package layout per AGENTS.md hex rules, ports, flows, verification plan, open questions). Awaiting result.
+
+## 2026-08-17 23:10 — Architecture first draft delivered
+SsOciArchitect (software-architect) delivered the draft; saved verbatim at .journal/001/ARCHITECTURE-DRAFT.md.
+Highlights (Incus claims verified in lxc/incus source):
+- Incus never parses the product key; identity from os/release/arch/variant fields. Serial must be >=8 chars, first 8 = YYYYMMDD. Fingerprint = combined_disk-kvm-img_sha256 on the metadata item = sha256(metaBytes ++ diskBytes); Incus verifies per-file sha256 and the combined hash itself.
+- File item paths join from the HOST ROOT (not stream base URL) — proxy must own its host root; open question #2.
+- imgoci/go has NO streaming fetch API (Dest is path-backed) → v0 needs a small blobfetch adapter (manifest GET by digest + blob stream + decomp); upstream io.Reader fetch API proposed as follow-up.
+- Annotation ns: io.github.imgoci.simplestreams.* (os/release/variant/serial/aliases at index; combined.disk-kvm-img.sha256 on metadata entries).
+- Packages: pure core catalog/stream/fileurl/combined/decomp; orchestration proxy/ + pub/ (declare ports, mockery mocks); adapters imgsrc/imgpub/tags/blobfetch/httpapi; cli wiring on template.
+- Stateless serve: atomic snapshot refresher, last-known-good per ref on transient failure; /f/<host>/<repo…>/<digest>/<compression>/<filename> path scheme parsed positionally from both ends.
+- e2e plan: testcontainers registry + real incus simplestreams client lib in-process; manual: incus remote add.
+Top prototype risks: (1) http vs https for remote add, (2) host-root path joining, (3) blobfetch scope, (4) arch spelling mapping.
+Status: awaiting user review of draft; next session likely starts prototyping.
