@@ -18,3 +18,13 @@ Key facts:
 - This repo is an untouched template-go clone (Meigma template: cobra/viper CLI, moon, mise, melange/apko, release-please).
 - Spec has incus target + incus-vm representation; SimpleStreams is the catalog protocol Incus/LXD consume.
 Next: brainstorm design direction with user.
+
+## 2026-08-17 22:48 — Brainstorm settled; architect agent spawned
+Decisions from brainstorm with user:
+- simplestreams-oci = translation proxy: imgoci releases in OCI registries (via imgoci/go) on the back, simplestreams protocol on the front; Incus is the target consumer.
+- Own both sides of delivery: one CLI, `publish` + `serve` subcommands. `publish` wraps imgoci/go Client.Publish, computes Incus combined hashes (sha256 metadata++disk), stamps custom annotations (ReleaseSpec/FileSpec.Annotations already support this — verified in publish.go).
+- Custom annotation namespace outside reserved io.imgoci.* (spec-clean; consumers ignore foreign annotations). Index-level: os/release/variant/serial/aliases. Entry-level: combined hashes on metadata entry.
+- Granularity: one release index = one os/release/variant/serial; entries fan per-arch.
+- v0 scope: incus-vm only (incus.tar.xz + disk-kvm.img ftypes). No containers — Incus pulls OCI app containers natively; system-container repr would be an imgoci spec addendum, not our problem. Un-annotated releases skipped+logged.
+- Proxy stateless, metadata-only: sha256/size from imgoci content annotations; no file reads at catalog build; file GETs stream from registry w/ on-the-fly decompression; combined hashes relayed producer-asserted, unverified in v0.
+Spawned software-architect agent SsOciArchitect for first-draft architecture (9-point deliverable incl. Incus protocol verification, package layout per AGENTS.md hex rules, ports, flows, verification plan, open questions). Awaiting result.
