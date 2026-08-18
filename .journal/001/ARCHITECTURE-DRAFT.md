@@ -1,267 +1,129 @@
-# simplestreams-oci — first-draft architecture
+# simplestreams-oci — revised first-draft architecture (v2)
 
-Draft for prototyping. Incus protocol claims are tagged **[V]** (verified in source) or **[A]** (assumed, needs prototype check). Sources: `lxc/incus` `shared/simplestreams/{products,simplestreams,index}.go` and `client/simplestreams_images.go` (main branch, read 2026-08-18); `imgoci/spec` spec.md §3, §5, §7, §8; `imgoci/go` public API (`client.go`, `publish.go`, `fetch.go`, `resolve.go`, `list.go`, `fetchfiles.go`, `entry.go`, `dest.go`) and its architecture explainer.
+Revision over v1: the simplestreams side is now built on **`github.com/imgoci/go-simplestreams`** (read at `/Users/josh/code/imgoci/go-simplestreams`, module `v0.x`, Go 1.26). Incus protocol claims remain tagged **[V]** (verified in `lxc/incus` source) / **[A]** (assumed). New tag **[C]**: claim cross-checked against `go-simplestreams/schema/incus` CUE. Sources as before, plus go-simplestreams root package (`documents.go`, `items.go`, `builders.go`, `artifact.go`, `path.go`, `metadata.go`, `signing.go`, `mirror.go`, `writer.go`, `source.go`, `options.go`), `adapters/{fsmirror,httpmirror}`, `schema/{embed.go,incus,linuxcontainers}`, `.journal/{SIMPLE_STREAMS,TECH_NOTES}.md`.
 
-## 0. What the Incus client actually requires (grounding)
+## 0. Protocol grounding, re-checked against schema/incus
 
-- `GET <base>/streams/v1/index.json` → `Stream{index: map[string]{datatype, path, products[]}}`. Incus only uses entries with `datatype == "image-downloads"` and a **non-empty `products` list**; `format`, `updated`, `content_id` are never checked. **[V]** (`getImages`)
-- Products JSON: Incus **never parses the product key**; identity comes from the `os`/`release`/`arch`/`variant` fields. Key format `os:release:arch:variant` is convention only. **[V]** (`ToAPI` ignores map keys)
-- Version key (serial): must be ≥8 chars and `name[0:8]` must parse as `YYYYMMDD`; it becomes the image creation date and the `serial` property. **[V]**
-- VM image = items with `ftype: "incus.tar.xz"` (metadata) + `ftype: "disk-kvm.img"` (disk). `disk-kvm.img` root ⇒ `image.Type = "virtual-machine"`. **[V]**
-- Fingerprint = `combined_disk-kvm-img_sha256` **on the metadata item**. After download Incus recomputes `sha256(metaBytes ‖ rootBytes)` and rejects on mismatch — so it is the sha256 of the served metadata file bytes concatenated with the served disk file bytes, in that order. **[V]** (`ToAPI` + tail of `GetImageFile`)
-- Each item's `sha256` is verified per file during download (`DownloadFileHash`), and `path` is an arbitrary relative path: index/products paths are joined with the stream base URL (`url.JoinPath`), file paths are joined against the **host** (`urlJoinPathAbsolute` on `httpHost`), trying plain `http://` first, then `https://`. **[V]** Consequence: serve the proxy at its own host/port root, not path-mounted under a prefix (file paths appear to resolve from host root — flagged in §9). The last path segment becomes the reported filename. **[V]**
-- `arch` must resolve through Incus `osarch.ArchitectureID` (`amd64`, `arm64` work — images.linuxcontainers.org publishes those spellings). **[A]** — prototype check; `arm/v7`-style imgoci values need mapping (`armhf`).
-- Content-Length / Range on file GETs: not required for correctness; hash-verified streaming download. **[A]** (did not read `util.DownloadFileHash`).
+Everything verified in v1 stands. Cross-check against the CUE incus profile:
+
+| Claim | lxc/incus source | schema/incus CUE | Verdict |
+|---|---|---|---|
+| `content_id` | never read **[V]** | `content_id!: "images"` required | CUE stricter; we emit `"images"` — no conflict for us |
+| product `datatype` | checked only on the **index entry** **[V]** | required `"image-downloads"` on the product file | CUE stricter; comply |
+| `aliases`, `release_title`, `variant`, `requirements` | all optional to the client **[V]** | all required (`!`) | CUE stricter; we always emit them (`requirements: {}`, `aliases` may be `""` — client splits only when non-empty **[V]**) |
+| combined fields | client also reads `combined_disk1-img_sha256`, `combined_uefi1-img_sha256` **[V]** | **missing** from closed `#Item` — such a document fails validation | ⚠ upstream schema gap (flagged, not designed around; v0 emits only `combined_disk-kvm-img_sha256`, which the CUE models **[C]**) |
+| version `label`/`pubname` | client reads both **[V]** | `#Version` is closed with only `items!` — a version carrying `label` fails validation | ⚠ upstream schema gap; v0 emits neither, so unaffected |
+| item `md5`/`sha512`/`mirrors` | runtime `Item` supports them | absent from closed `#Item` | consistent with v0 output (sha256 only) |
+| ftype vocabulary | client also accepts `disk1.img`, `uefi1.img` roots **[V]** | `#IncusFileType` = `incus.tar.xz \| lxd.tar.xz \| root.tar.xz \| squashfs \| disk-kvm.img \| squashfs.vcdiff` | narrower than client; v0's `incus.tar.xz`/`disk-kvm.img` are covered **[C]** |
+| `requirements` keys | client copies arbitrary `requirements.*` **[V]** | closed vocabulary (cgroup/secureboot/cdrom_*) | v0 emits none; noted |
+
+No CUE rule contradicts anything verified in lxc/incus; every divergence is the CUE profile being **stricter than the client** (fine for a producer) or **narrower than the client** (upstream gaps flagged above — worth an issue on go-simplestreams, not silent workarounds). go-simplestreams' own journal warns the Canonical JSON schemas are unreliable and prefers upstream source/live streams — consistent with my method.
+
+Unchanged verified facts driving the design: product key unparsed; serial ≥8 chars, `YYYYMMDD` prefix; fingerprint = `combined_disk-kvm-img_sha256` on the metadata item, checked as `sha256(meta‖root)` post-download; per-file sha256 verified during download; item `path` is an arbitrary relative path, filename = last segment; file GETs join against host root, http-then-https. **[V]**
 
 ## 1. Domain model (pure core)
 
-The core is a translation: *annotated release view → simplestreams product tree*. No I/O anywhere in it.
+go-simplestreams now owns the product-tree half. Our core keeps only what is OCI-specific:
 
 ```go
-// catalog.Release is the proxy-side view of one fetched, spec-valid imgoci
-// release, decoupled from imgoci/go types at the port boundary.
-type Release struct {
-    Host, Repository string        // where it lives (for file locators)
-    Name, Version    string        // io.imgoci.name / oci version
-    Annotations      map[string]string // root annotations (incl. ours)
-    Entries          []Entry       // file entries (selector, content digest/size, filename, annotations)
-}
+// catalog.Release — proxy-side view of one fetched, spec-valid imgoci release
+// (unchanged from v1: Host, Repository, Name, Version, Annotations, Entries).
 
-// catalog.ProductInfo — parsed from our root annotations.
-type ProductInfo struct {
-    OS, ReleaseName, Variant, Serial string
-    Aliases                          []string // optional
-}
-
-// catalog.Item — one simplestreams item plus the locator the HTTP layer
-// encodes into its path.
-type Item struct {
-    FType    string   // "incus.tar.xz" | "disk-kvm.img"
-    SHA256   string   // hex of io.imgoci.content.digest
-    Size     int64    // io.imgoci.content.size
-    Combined string   // fingerprint hex; set on the metadata item only
-    Loc      FileLoc
-}
-
-// catalog.FileLoc names one stored file statelessly.
-type FileLoc struct {
-    Host, Repository string
-    ManifestDigest   string // sha256 hex of the file manifest
-    Compression      string // imgoci compression of that stored alternative
-    Filename         string // io.imgoci.filename
-    Size             int64  // decoded size; best-effort Content-Length
-}
+// catalog.FileLoc — stateless locator for one stored file (unchanged):
+// Host, Repository, ManifestDigest, Compression, Filename, Size.
 ```
 
-**Translation rules for `incus-vm` (v0):**
+The v1 `catalog.Item` type is **deleted**. Translation now emits go-simplestreams runtime nodes directly:
 
-1. Parse `ProductInfo` from root annotations; any required key missing/invalid ⇒ skip release (§7).
-2. Group entries by deliverable key (arch, target=`incus`, representation=`incus-vm`, usage=∅). Per architecture, require exactly the roles `metadata` and `disk`; pick one transport alternative per role — preference order `none, zstd, xz, gzip` (only decoders we ship; unknown compression ⇒ skip that arch).
-3. Map imgoci architecture → simplestreams arch: `amd64`/`arm64` pass through; anything else skipped with a warning in v0 (mapping table is an open question).
-4. Each architecture ⇒ one **product**: `os`, `release` (= `release_title`), `variant`, `arch`; key `os:release:arch:variant` (cosmetic, **[V]** unparsed). One **version** keyed by `Serial`, with two items: metadata (`ftype incus.tar.xz`, carries `combined_disk-kvm-img_sha256` relayed from our entry annotation) and disk (`ftype disk-kvm.img`).
-5. Multiple releases mapping to the same product (same os/release/arch/variant, different serials) merge into one product with several versions. Same product **and** serial from two sources: first configured source wins, warn.
-6. `sha256`/`size` per item come straight from `io.imgoci.content.digest`/`.size` — the proxy serves decoded bytes, so per-file hashes hold by construction. The combined hash is relayed producer-asserted, never recomputed (contract #7).
+**Translation rules for `incus-vm` (v0)** — same rules 1–6 as v1, now expressed in library calls:
+
+- `ss.NewProductFile("images")` per snapshot; set `DataType = "image-downloads"`, `Updated` (RFC 2822 — cosmetic, unparsed by Incus **[V]**).
+- Per architecture: `productFile.SetProduct("os:release:arch:variant", …)` with product `Metadata` keys `os`, `release`, `release_title`, `arch`, `variant`, `aliases`, `requirements` (via `Product.SetMetadata`; the runtime model deliberately keeps consumer-profile fields in the metadata map).
+- `product.SetVersion(serial, …)`; two `version.SetItem(name, …)` calls keyed and typed by ftype: `incus.tar.xz` (metadata role) and `disk-kvm.img` (disk role). `Item.FileType`, `Item.Path` (`ss.RelativePath` from `internal/fileurl`), `Item.Size`, `Item.SHA256` come from imgoci `content.*` annotations; the fingerprint is relayed with `item.SetMetadata("combined_disk-kvm-img_sha256", hex)` — unknown metadata is preserved and flattened at marshal time (verified in `documents.go` marshal path).
+- Index: `ss.BuildIndex([]ss.BuildIndexEntry{{ContentID: "images", Path: "streams/v1/images.json", Format: ss.ProductsFormat, DataType: "image-downloads", Products: keys}}, updated)`. Non-empty `products` list is what Incus requires **[V]**; `BuildIndex` enforces path validity and duplicate content IDs.
+- Serialization: `ss.MarshalJSONDocument(index / productFile)` — deterministic, sorted, trailing newline; snapshot caches the marshaled bytes.
+- Duplicate item identity across sources: guarded with `ss.CheckDuplicateItemRefs` over emitted `ss.ItemRef`s; first configured source wins, warn (unchanged policy).
 
 ## 2. Annotation namespace and keys
 
-Namespace: **`io.github.imgoci.simplestreams.`** — reverse-DNS over `github.com/imgoci`, which the project controls; safely outside the reserved `io.imgoci.` prefix (spec §5.2 permits foreign keys; consumers must ignore unknowns).
+**Unchanged from v1** (contract): namespace `io.github.imgoci.simplestreams.`, index-level `os`/`release`/`variant`/`serial` required + `aliases` optional; entry-level `combined.disk-kvm-img.sha256` on every metadata-role entry. Worked example as in v1. One addition: the annotation-key → simplestreams-field mapping is now normatively checked in tests against `schema/incus.ValidateRuntimeProductFile`, so a key-set change that breaks the Incus profile fails CI.
 
-Index-level (root annotations):
+## 3. Package layout (redrawn)
 
-| Key | Required | Syntax | Maps to |
-|---|---|---|---|
-| `…simplestreams.os` | yes | non-empty, no whitespace | `Product.os` |
-| `…simplestreams.release` | yes | same | `Product.release`, `release_title` |
-| `…simplestreams.variant` | yes | same; `default` for none | `Product.variant` |
-| `…simplestreams.serial` | yes | ≥8 chars; first 8 a valid `YYYYMMDD` date; recommend `YYYYMMDD.N` or `YYYYMMDD_HHMM` (avoid `:` in URL paths) | version key / `serial` property |
-| `…simplestreams.aliases` | no | comma-separated alias names, no whitespace | `Product.aliases` |
-
-Entry-level, on **every `role=metadata` entry** of an `incus-vm` deliverable (identical across transport alternatives of the same file, mirroring the content-annotation rule):
-
-| Key | Syntax | Maps to |
-|---|---|---|
-| `…simplestreams.combined.disk-kvm-img.sha256` | 64 lowercase hex | `combined_disk-kvm-img_sha256` → Incus fingerprint |
-
-The key name mirrors the simplestreams field so future combined fields (`combined.squashfs.sha256`, …) extend the same pattern.
-
-Worked example (digests elided):
-
-```json
-{
-  "schemaVersion": 2,
-  "mediaType": "application/vnd.oci.image.index.v1+json",
-  "artifactType": "application/vnd.imgoci.release.v1",
-  "annotations": {
-    "io.imgoci.name": "acmeos-trixie-cloud",
-    "org.opencontainers.image.version": "20260818.1",
-    "io.github.imgoci.simplestreams.os": "acmeos",
-    "io.github.imgoci.simplestreams.release": "trixie",
-    "io.github.imgoci.simplestreams.variant": "cloud",
-    "io.github.imgoci.simplestreams.serial": "20260818.1",
-    "io.github.imgoci.simplestreams.aliases": "acmeos/trixie/cloud"
-  },
-  "manifests": [
-    { "artifactType": "application/vnd.imgoci.file.v1", "digest": "sha256:…", "size": 427,
-      "annotations": {
-        "io.imgoci.architecture": "amd64", "io.imgoci.target": "incus",
-        "io.imgoci.representation": "incus-vm", "io.imgoci.role": "metadata",
-        "io.imgoci.compression": "none",
-        "io.imgoci.content.digest": "sha256:…", "io.imgoci.content.size": "1372160",
-        "io.imgoci.filename": "incus.tar.xz",
-        "io.github.imgoci.simplestreams.combined.disk-kvm-img.sha256": "9c7d…"
-      }},
-    { "…disk entry: role=disk, filename=disk.qcow2, compression=zstd, content.* = qcow2 digest/size…" }
-  ]
-}
-```
-
-## 3. Package layout
-
-Module renamed to `github.com/imgoci/simplestreams-oci`; `cmd/template-go` → `cmd/simplestreams-oci`. Each package: one job (A3/A4), `doc.go` everywhere (D4).
+Deleted relative to v1: **`internal/stream`** (replaced by go-simplestreams document types/builders/marshaling), **`internal/combined`** (replaced by `ss.SHA256Concat`). Kept but shrunk: `internal/fileurl` (the OCI locator scheme is ours; go-simplestreams only validates `RelativePath`, it defines no locator encoding). imgoci side unchanged.
 
 ```
-cmd/simplestreams-oci/      main: version stamping, calls internal/cli
-internal/cli/               cobra wiring: root, publish, serve (existing template pattern)
-internal/config/            viper-backed config types for serve + publish flags (existing package, extended)
+cmd/simplestreams-oci/      main
+internal/cli/               cobra wiring: root, publish, serve
+internal/config/            viper config for serve + publish
 
-# pure core (stdlib + codecs only)
-internal/catalog/           annotation parsing, incus-vm translation, product-tree merge, skip decisions
-internal/stream/            simplestreams wire structs (Stream, Products, Product, Version, Item) + JSON encoding
-internal/fileurl/           FileLoc <-> URL path scheme, encode + parse (tiny, pure)
-internal/combined/          streaming combined-hash computation over io.Readers (pure w.r.t. side effects)
-internal/decomp/            bounded streaming decoders: none/gzip/xz/zstd (io.Reader in, io.Reader out)
+# pure core
+internal/catalog/           annotation parsing, incus-vm translation → *ss.ProductFile/*ss.Index,
+                            merge + skip decisions; imports go-simplestreams root pkg (data-only use)
+internal/fileurl/           catalog.FileLoc <-> ss.RelativePath scheme, encode + parse
+internal/decomp/            bounded streaming decoders: none/gzip/xz/zstd
 
-# orchestration cores (declare the ports)
-internal/proxy/             serve service: refresher, atomic catalog snapshot, request handling logic
-internal/proxy/mocks/       mockery output for proxy ports (T2/T3)
-internal/pub/               publish service: input validation, combined-hash pass, ReleaseSpec assembly
-internal/pub/mocks/         mockery output for pub ports
+# orchestration cores (declare ports; mockery mocks in mocks/ per T2/T3)
+internal/proxy/  (+mocks/)  serve service: refresher, atomic snapshot of marshaled docs, request logic
+internal/pub/    (+mocks/)  publish service: input validation, combined hash via ss.SHA256Concat,
+                            ReleaseSpec assembly
 
-# adapters (one purpose each, A2)
-internal/imgsrc/            ReleaseSource adapter over imgoci/go Client.Fetch → catalog.Release
-internal/imgpub/            Publisher adapter over imgoci/go Client.Publish
-internal/tags/              TagLister adapter: OCI /v2/<repo>/tags/list (oras-go remote)
-internal/blobfetch/         FileStreamer adapter: file-manifest GET by digest + layer blob stream, composed with decomp
-internal/httpapi/           driving adapter: net/http server, routes, content types, error mapping
+# adapters (A2)
+internal/imgsrc/            ReleaseSource over imgoci/go Client.Fetch
+internal/imgpub/            Publisher over imgoci/go Client.Publish
+internal/tags/              OCI tag listing (/v2/<repo>/tags/list)
+internal/blobfetch/         FileStreamer: file-manifest GET by digest + layer stream + decomp
+internal/httpapi/           net/http server: routes, cached document bytes, file streaming
 ```
 
-Rejected alternatives: (a) folding `stream` into `catalog` — kept separate so wire shape changes don't churn translation tests; (b) one `internal/oci` mega-adapter — violates A2; (c) reusing imgoci/go for file streaming — impossible today, its retrieval is path-backed (`Dest`), see §4/§9.
+Rejected: building the serve side on go-simplestreams' `Mirror` — that is a **consumer** (read) model; we are the producer/server. Also rejected: generating a static mirror through `Store`/`AtomicStore` — those are explicitly "writer foundation ports only" today (TECH_NOTES: publish orchestration, artifact writes, signing, atomic updates are future work upstream). A future `mirror` subcommand (render releases into an `fsmirror`-style static tree) would sit exactly on those ports once upstream finishes them — noted, not v0.
 
 ## 4. Ports
 
-Declared by the orchestration cores, mocked with mockery into `mocks/` subpackages (T2/T3).
-
-```go
-// internal/proxy
-
-// ReleaseSource fetches and spec-validates one release index.
-type ReleaseSource interface {
-    Fetch(ctx context.Context, ref string) (catalog.Release, error)
-}
-
-// TagLister lists tags in one OCI repository (for tag-pattern sources).
-type TagLister interface {
-    Tags(ctx context.Context, host, repository string) ([]string, error)
-}
-
-// FileStreamer opens the decoded content stream for one stored file.
-// size is the decoded length when known, else -1.
-type FileStreamer interface {
-    Open(ctx context.Context, loc catalog.FileLoc) (rc io.ReadCloser, size int64, err error)
-}
-```
-
-```go
-// internal/pub
-
-// Publisher publishes an assembled release spec and returns the index digest.
-type Publisher interface {
-    Publish(ctx context.Context, ref string, spec imgoci.ReleaseSpec) (digest.Digest, error)
-}
-```
-
-`Publisher` intentionally speaks `imgoci.ReleaseSpec` — it is a plain data struct and inventing a parallel spec type buys nothing (tradeoff noted; if it grows I/O-coupled fields, introduce our own). `imgsrc` maps `*imgoci.Release`/`Index`/`FileEntry` onto `catalog.Release` so the core never imports imgoci/go.
+Unchanged from v1 (`ReleaseSource`, `TagLister`, `FileStreamer` in `internal/proxy`; `Publisher` in `internal/pub`), with one signature change: the refresher's output to the snapshot is now `*ss.ProductFile`/`*ss.Index` built by `catalog`. go-simplestreams' own `Source` port is not implemented by us in v0 (nothing consumes a mirror); it appears only in functional tests (§8).
 
 ## 5. `publish` flow
 
-```
-simplestreams-oci publish \
-  --ref ghcr.io/acme/acmeos:trixie-20260818.1 \
-  --os acmeos --release trixie [--variant cloud] [--serial 20260818.1] \
-  [--alias acmeos/trixie/cloud]... \
-  --image arch=amd64,metadata=./amd64/incus.tar.xz,disk=./amd64/disk.qcow2 \
-  [--image arch=arm64,...]... \
-  [--name acmeos-trixie-cloud] [--version 20260818.1]
-```
-
-1. `internal/cli` parses flags into a pure `pub.Input`; defaults: `variant=default`, `serial` = UTC `YYYYMMDD_HHMM` now, `name` = slug of os-release-variant, `version` = serial.
-2. `pub` validates: serial grammar (date-prefixed), ≥1 image, arch uniqueness, alias syntax.
-3. Per arch, one streaming pass per file through `internal/combined`: `sha256(metadataBytes ‖ diskBytes)` (order verified in §0). v0 publishes `compression=none` for both roles, so source bytes == decoded bytes and no decode pass is needed (compressed transport at publish is deferred, §9).
-4. Assemble `imgoci.ReleaseSpec`: root `Annotations` = the §2 index keys; per arch two `FileSpec`s — metadata (`target=incus, representation=incus-vm, role=metadata, compression=none`, filename `incus.tar.xz`, annotation = combined hash) and disk (`role=disk`, filename `disk.qcow2`). imgoci/go computes content digest/size itself and enforces incus-vm producer rules (roles, `incus` target).
-5. `Publisher.Publish`; print the canonical index digest and a per-arch summary to `Out`.
+Steps 1–2, 4–5 unchanged from v1. Step 3 now delegates: per architecture, open metadata and disk files and compute the fingerprint with **`ss.SHA256Concat(metaFile, diskFile)`** — order meta-then-disk matches Incus' post-download check **[V]**. v0 still publishes `compression=none`, so file bytes == decoded bytes and no decode pass is needed. Per-file sha256/size are computed by imgoci/go during `Publish`, not by us.
 
 ## 6. `serve` flow
 
-Config (viper: file + env + flags):
-
-```yaml
-listen: ":8080"
-refresh: 15m               # 0 disables periodic refresh (refresh once at start)
-sources:
-  - ref: ghcr.io/acme/acmeos:trixie-20260818.1   # explicit reference
-  - repo: ghcr.io/acme/acmeos                     # tag pattern via TagLister
-    tags: "trixie-*"                              # path.Match glob
-# registry auth: reuse docker login (imgoci WithDockerCredentials) — opt-in flag
-```
-
-**Catalog build (refresher):** on start and every `refresh`: expand pattern sources through `TagLister`; `ReleaseSource.Fetch` each ref (imgoci/go validates the index fully); run `catalog` translation; merge into one `stream.Products` + `stream.Stream`; swap into an `atomic.Pointer[Snapshot]`. Per-ref transient failure reuses that ref's last successful `catalog.Release` when one exists; validation/skip failures drop it (§7). The proxy holds no disk state — restart rebuilds from the registries.
-
-**Routes** (`internal/httpapi`):
-
-| Route | Serves |
-|---|---|
-| `GET /streams/v1/index.json` | one index entry, `datatype: image-downloads`, `path: streams/v1/images.json`, `products`: current keys |
-| `GET /streams/v1/images.json` | the snapshot's products document |
-| `GET /f/...` | file streaming (below) |
-| `GET /healthz` | snapshot age + source counts |
-
-**File path scheme** — stateless, parsed positionally from both ends (no marker segments; the digest's fixed 64-hex shape disambiguates the variable-depth repo):
+Config, refresh model, authorization, and the stateless file-path scheme are unchanged from v1:
 
 ```
 /f/<host>/<repository…>/<manifest-sha256-hex>/<compression>/<filename>
-e.g. /f/ghcr.io/acme/acmeos/9c7d…e1/zstd/disk.qcow2
 ```
 
-`host` = first segment, `filename` = last (Incus reports it as the downloaded name **[V]**), `compression` = second-to-last, digest = third-to-last, repo = the middle. Encodes registry + repo + manifest digest + role's stored alternative with no server state, so paths survive restart and Incus's on-disk products cache.
+`internal/fileurl` renders this as an `ss.RelativePath` and validates with `RelativePath.Validate()` (non-empty, relative, no `..`/`...`/backslash traversal — matching the protocol's own path rules), then our parser applies the positional grammar (host first, filename last, 64-hex digest third-from-last).
 
-**File GET path:** parse → authorize: `(host, repo)` must be in configured sources (prevents becoming an open relay/decompression proxy) → `FileStreamer.Open`: GET file manifest by digest (verify manifest-byte digest, validate standard-form §3.1), GET the layer blob, wrap in the `decomp` decoder named by the path (bounded decoder window, imgoci-style) → stream to the response (`io.Copy`, no buffering, P2). `Content-Length` set best-effort from the snapshot's `FileLoc.Size` (always when `compression=none`); otherwise chunked. v0 supports standard file manifests only; BigOCI entries are skipped at catalog build (§7). No server-side content-digest verification — Incus verifies per-file sha256 and the fingerprint itself **[V]**; a corrupted stream fails safely on the client.
+Catalog build now ends in: build documents via §1, validate the assembled product file with `schema/incus.ValidateRuntimeProductFile` (**debug/test builds and an opt-in `--validate` flag only** — it spins a CUE context per call, too heavy for every refresh on the hot path; P1), marshal once with `ss.MarshalJSONDocument`, store bytes in the snapshot. Routes serve the cached bytes:
 
-## 7. Failure and skip semantics (serve)
-
-| Condition | Action |
+| Route | Serves |
 |---|---|
-| Release fails imgoci validation (`ErrInvalidIndex`) | skip release, log warn with ref + reason |
-| Missing/invalid `…simplestreams.*` required annotation | skip release, log warn |
-| No `incus-vm` deliverable in a valid annotated release | skip release, log info |
-| Arch with missing role, unsupported compression, or non-standard (BigOCI) manifest type only | skip that arch, log warn |
-| Metadata entry missing `combined.disk-kvm-img.sha256` | skip that arch (no fingerprint ⇒ Incus rejects it anyway **[V]**) |
-| Duplicate product+serial across sources | first configured source wins, warn |
-| File GET: malformed path / (host,repo) not configured | 404 |
-| File GET: upstream registry error / digest mismatch on manifest | 502 (or mid-stream abort once bytes are sent) |
+| `GET /streams/v1/index.json` | snapshot's marshaled `ss.Index` (path constant `ss.DefaultIndexPath`) |
+| `GET /streams/v1/images.json` | snapshot's marshaled `ss.ProductFile` |
+| `GET /f/...` | file streaming via `FileStreamer` (manifest GET by digest → layer blob → `decomp` → response), unchanged |
+| `GET /healthz` | snapshot age + source counts |
+
+Signing: not in v0. go-simplestreams handles *verification* of `.sjson`; **producing** signed metadata is unfinished upstream (flagged). Incus consumes unsigned `streams/v1/index.json` **[V]**, so nothing blocks; serving `index.sjson` becomes trivial once upstream grows signing.
+
+## 7. Failure and skip semantics
+
+Unchanged from v1 (table stands). One addition: if the assembled product file ever fails `ValidateRuntimeProductFile` under `--validate`, the snapshot swap is refused and the previous snapshot keeps serving (fail-closed on our own output, fail-open on upstream releases).
 
 ## 8. Verification plan
 
-- **Unit (pure):** `catalog` golden tests — annotated release view in, products JSON out, including merge, skip, and duplicate-serial cases; `fileurl` encode/parse round-trips incl. hostile paths; `combined` against a fixed vector; `decomp` per codec incl. trailing-byte rejection; serial grammar.
-- **Integration (mock ports, mockery):** refresher with mocked `ReleaseSource`/`TagLister` — snapshot swap, last-known-good on transient failure, skip logging; `httpapi` with mocked `FileStreamer` — route/status/header contract; `pub` with mocked `Publisher` — assembled `ReleaseSpec` shape incl. annotations.
-- **Functional/e2e:** testcontainers `registry:2` (or zot): `publish` a tiny fixture release, run `serve`, then consume with the **real Incus client library** (`github.com/lxc/incus/v7/shared/simplestreams` + `client.ProtocolSimpleStreams` in a test) — `ListImages`, `GetImage`, `GetImageFile` into temp files; that exercises Incus's exact parsing, per-file sha256, and fingerprint check without a daemon. Manual acceptance: `incus remote add test <url> --protocol simplestreams && incus launch test:<alias> --vm` against a real Incus.
+- **Unit (pure):** `catalog` golden tests — annotated release views in, `MarshalJSONDocument` bytes out — plus `schema/incus.ValidateRuntimeProductFile` over every golden output; `fileurl` round-trips incl. hostile paths (leaning on `RelativePath.Validate`); `decomp` per codec; serial grammar. Combined-hash vector test moves upstream's way: `ss.SHA256Concat` is already tested there; we test only our call ordering (meta before disk).
+- **Integration (mock ports):** unchanged (refresher, httpapi, pub with mockery mocks).
+- **Functional/e2e:** testcontainers registry + `publish` + `serve`, then consume the running proxy **twice**: (a) with go-simplestreams itself — `httpmirror.New(proxyURL)` → `ss.NewMirror` → `Index`/`ProductFile`/`Items` → `ArtifactRef.VerifyReader` over the file GETs (checks per-file sha256 + size exactly as a strict client would); (b) with the real Incus client library (`shared/simplestreams` + `client.ProtocolSimpleStreams.GetImageFile`) for the fingerprint check. Manual acceptance: `incus remote add … --protocol simplestreams` + `incus launch --vm`.
 
-## 9. Open questions and prototype experiments (by risk)
+## 9. Open questions, risks, upstream flags (by risk)
 
-1. **TLS/scheme for `incus remote add --protocol simplestreams`** — file downloads try http-then-https **[V]**, but whether the remote URL itself may be plain `http://` (dev) or needs a valid cert is unverified. *Experiment: remote add against the prototype over http and self-signed https.*
-2. **Path-mounted base URLs** — file paths appear joined from the **host root** (`urlJoinPathAbsolute(httpHost, path)`), unlike index/products paths (base-URL join) **[V-ish]**; I did not read `urlJoinPathAbsolute`. If confirmed, the proxy must own its host root — document it, or emit absolute file URLs? (Incus splits on `/` for filename; full-URL paths unverified.) *Experiment: serve under a sub-path and watch the file GETs.*
-3. **Streaming gap in imgoci/go** — `blobfetch` reimplements manifest GET + blob streaming + auth that imgoci/go has internally but doesn't export. Right call for v0; propose an upstream `io.Reader`-based fetch API and collapse `blobfetch` onto it later.
-4. **Architecture spellings** — `amd64`/`arm64` through `osarch` **[A]**; mapping for `arm/v7`→`armhf` etc. deferred. *Experiment: list images from real Incus for both arches.*
-5. **`incus:` alias resolution details** — alias dedup/preference (`sortedImages`) read but not exercised; verify aliases surface as expected in `incus image list`.
-6. **Compressed publish inputs** — v0 publishes `compression=none`; accepting pre-compressed sources requires a decode pass for the combined hash. Defer until registry-size pressure is real (qcow2 already compresses internally).
-7. **Refresh model** — fixed interval + last-known-good is v0; webhook/on-demand invalidation and per-source intervals only if refresh cost shows up.
-8. **Requirements/EOL metadata** (`requirements.*`, `support_eol`) — deliberately out of the v0 key set; add keys when a consumer needs them.
+1. **TLS/scheme for `incus remote add`** — unchanged, still the top prototype experiment.
+2. **Host-root file path joining** (`urlJoinPathAbsolute`) — unchanged; serve at host root until disproven.
+3. **imgoci/go streaming gap** — unchanged; `blobfetch` stays here, upstream `io.Reader` fetch API proposed.
+4. **Upstream (go-simplestreams) gaps found, belong upstream:** (a) `schema/incus` `#Item` omits `combined_disk1-img_sha256`/`combined_uefi1-img_sha256` and `#Version` omits `label`/`pubname` — closed defs reject documents the Incus client accepts; (b) metadata **signing** and `Store`/`AtomicStore` publish orchestration are unfinished (self-declared); (c) typed combined-hash fields on the runtime `Item` would beat `SetMetadata` string keys. None block v0.
+5. **Belongs here, not upstream:** the OCI file-locator path scheme, HTTP serving, OCI blob streaming/decompression, tag listing, imgoci annotation contract.
+6. **Architecture spellings / `arm/v7`→`armhf` mapping** — unchanged **[A]**.
+7. **Compressed publish inputs**, **refresh model**, **requirements/EOL keys** — unchanged deferrals; note `#Requirements`' closed CUE vocabulary when requirements keys do land.
+8. **CUE validation cost** — `ValidateRuntimeProductFile` builds a CUE context per call; if `--validate` becomes always-on, cache the loaded schema value (or push a reusable-context API upstream).

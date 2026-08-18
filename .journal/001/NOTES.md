@@ -41,3 +41,15 @@ Highlights (Incus claims verified in lxc/incus source):
 - e2e plan: testcontainers registry + real incus simplestreams client lib in-process; manual: incus remote add.
 Top prototype risks: (1) http vs https for remote add, (2) host-root path joining, (3) blobfetch scope, (4) arch spelling mapping.
 Status: awaiting user review of draft; next session likely starts prototyping.
+
+## 2026-08-17 23:35 — Draft revised onto go-simplestreams
+User pointed at ~/code/imgoci/go-simplestreams (existing org library: simplestreams document model, builders, deterministic marshal, RelativePath, SHA256Concat, consumer-side Mirror/Source + fsmirror/httpmirror adapters, CUE consumer profiles incl. schema/incus, signature verification). Architect revised the draft; v2 replaces v1 at .journal/001/ARCHITECTURE-DRAFT.md.
+Key changes v1→v2:
+- internal/stream and internal/combined DELETED: go-simplestreams owns wire structs/builders/marshaling (ss.NewProductFile/SetProduct/SetVersion/SetItem/BuildIndex/MarshalJSONDocument) and combined-hash (ss.SHA256Concat, meta-then-disk order matches Incus check).
+- Combined fingerprint relayed via item.SetMetadata("combined_disk-kvm-img_sha256", …); unknown metadata preserved at marshal.
+- fileurl kept (OCI locator scheme is ours) but validates via ss.RelativePath.
+- Serve side NOT built on go-simplestreams Mirror (consumer-read model) nor Store/AtomicStore (unfinished upstream writer foundations). Future `mirror` subcommand could sit on those once upstream finishes.
+- Catalog output optionally validated with schema/incus.ValidateRuntimeProductFile (test/golden + opt-in --validate; CUE ctx per call too heavy for hot path).
+- e2e now double-consumes: httpmirror+ss.NewMirror+VerifyReader AND real incus client lib.
+Upstream gaps flagged (belong in go-simplestreams, none block v0): schema/incus closed defs reject combined_disk1-img/uefi1-img + version label/pubname that real Incus accepts; signing production + Store/AtomicStore orchestration unfinished; typed combined-hash fields would beat SetMetadata.
+imgoci side of design unchanged. Status: v2 draft awaiting user review.
